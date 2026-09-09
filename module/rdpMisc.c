@@ -484,16 +484,18 @@ const char *
 g_socket_dir(void)
 {
     const char *socket_dir;
+    static char uid_path[256];
 
     socket_dir = getenv("XRDP_SOCKET_PATH");
     if (socket_dir == NULL || socket_dir[0] == '\0')
     {
-        socket_dir = "/tmp/.xrdp";
+        snprintf(uid_path, sizeof(uid_path),
+                 "/var/run/xrdp/%d", (int)getuid());
+        socket_dir = uid_path;
     }
 
     return socket_dir;
 }
-
 /*****************************************************************************/
 /* produce a hex dump */
 void

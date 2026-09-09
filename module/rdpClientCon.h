@@ -30,6 +30,60 @@ Client connection to xrdp
 
 #include "xup_client_info.h"
 
+/* Session capability bits sent to the accel-assist helper as message type 3
+   of the control batch. Must match XH_CAPS_* in xrdp's
+   xrdp_accel_assist/xrdp_accel_assist.h -- as with the message type numbers
+   themselves, the two repositories carry their own copy. */
+#define XH_CAPS_AVC444 (1 << 0)
+#define XH_CAPS_AVC444_V2 (1 << 1)
+
+/* XORGXRDP_TIMING=1: where a frame's time goes on this side of the pipe.
+   Capture is gated on the previous frame being acknowledged
+   (rdpDeferredUpdateCallback returns early while rect_id > rect_id_ack), so
+   the loop runs one frame deep no matter what xrdp's frames_in_flight
+   allows, and the rate is one over the sum of the stages. */
+struct rdp_timing
+{
+    int enabled;
+    int count;
+    int capture_total_ms;
+    int capture_max_ms;
+    int send_total_ms;
+    int send_max_ms;
+    int ack_total_ms;          /* send -> rect_id_ack, the lockstep gap */
+    int ack_max_ms;
+    /* The client-latency round trip xrdp measures and now sends with each
+       acknowledgement. Unlike ack_total_ms above, which runs from our send
+       to the acknowledgement and therefore contains our own capture
+       interval, this excludes it. */
+    int crtt_total_ms;
+    int crtt_max_ms;
+    int crtt_count;
+    int blocked;               /* callbacks that returned early on the gate */
+    CARD32 sent_ms;
+    /* Send time per frame, indexed by rect_id. The acknowledgement names
+       the frame it is for, and with more than one frame in flight that is
+       not the frame we sent most recently, so timing it against sent_ms
+       understates the round trip. */
+#define RDP_SEND_TIME_SLOTS 64
+    CARD32 send_time[RDP_SEND_TIME_SLOTS];
+    int blit_total_ms;         /* the CopyArea loop */
+    int sync_total_ms;         /* the 1x1 GetImage that drains the GPU */
+    int blit_count;
+    int force_drain;            /* XORGXRDP_CAPTURE_DRAIN=1 */
+    /* Why the loop is idle between frames. idle_total_ms is the dead time
+       from handing a frame off to starting the next capture; inflight_total
+       sums rect_id - rect_id_ack at capture start (0 means we drained
+       completely and gained nothing from a capture depth above 1);
+       damage_starved counts frames that ended with an empty dirtyRegion,
+       i.e. we then sat waiting for the application to draw. */
+    int idle_total_ms;
+    int capture_count;          /* frames actually sent, vs count = acks */
+    int idle_max_ms;
+    int inflight_total;
+    int damage_starved;
+};
+
 /* used in rdpGlyphs.c */
 struct font_cache
 {
@@ -105,6 +159,7 @@ struct _rdpClientCon
     int font_stamp;
 
     struct xup_client_info client_info;
+    struct rdp_timing timing;
 
     uint8_t *shmemptr;
     int shmemfd;
@@ -115,14 +170,47 @@ struct _rdpClientCon
     int rect_id_ack;
     enum shared_memory_status shmemstatus;
 
-    PixmapPtr accelAssistPixmaps[16];
+    /* Two capture buffers per monitor, alternated so a frame can be captured
+       while the helper still reads the previous one.
+
+       rdpCapture copies only the damage boxes, so alternating buffers would
+       leave neither one a complete picture -- each holding just the boxes
+       that happened to land in it. The main view survives that, reading back
+       exactly the rects written, but the AVC444 auxiliary view is rendered
+       full-frame and samples the whole texture, so it would read stale
+       pixels outside the current damage. That was visible as blocks of stale
+       content whenever damage was scattered, most obviously when dragging a
+       window.
+
+       accelAssistPending[mon][buf] is therefore the damage this buffer has
+       missed since it was last written. A capture into it copies the current
+       damage unioned with that debt, which restores the invariant a single
+       buffer had for free: whatever the helper reads, every pixel of it is
+       current. The client is still told only about the current damage. */
+    PixmapPtr accelAssistPixmaps[16][2];
+    RegionPtr accelAssistPending[16][2];
+    int accelAssistBuf[16];
+    int capture_depth;         /* XORGXRDP_CAPTURE_DEPTH, 1 or 2 */
 
     OsTimerPtr updateTimer;
     CARD32 lastUpdateTime; /* millisecond timestamp */
     int updateScheduled; /* boolean */
     int updateRetries;
 
+    /* Minimum spacing between captures for THIS connection. Seeded from
+       client_info, then steered at run time when adaptive pacing is on.
+       Per connection rather than per device because the right value is a
+       property of the client: measured on one host, a native client answers
+       in 11-16 ms while a browser client on the same session and the same
+       content answers in 222-289 ms. One device-wide constant has to be
+       tuned for the slower of the two. */
     CARD32 msFrameInterval;
+    int pace_enabled;          /* XORGXRDP_ADAPTIVE_PACE */
+    int pace_min_ms;           /* XORGXRDP_PACE_MIN_MS */
+    int pace_max_ms;           /* XORGXRDP_PACE_MAX_MS */
+    int pace_rtt_ms;           /* smoothed client rtt, the control signal */
+    int pace_samples;          /* acks seen, until the average is warm */
+    int pace_good_run;         /* consecutive acks the client kept up on */
 
     RegionPtr dirtyRegion;
 

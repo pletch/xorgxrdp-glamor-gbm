@@ -230,6 +230,7 @@ rdpClientConGotConnection(ScreenPtr pScreen, rdpPtr dev)
     clientCon->updateRetries = 0;
     clientCon->dev = dev;
     clientCon->shmemfd = -1;
+
     dev->last_event_time_ms = GetTimeInMillis();
     dev->do_dirty_ons = 1;
 
@@ -390,15 +391,83 @@ rdpShutdownAccelAssist(rdpPtr dev, rdpClientCon *clientCon) {
     pScreen = clientCon->dev->pScreen;
     for (index = 0; index < 16; index++)
     {
-        pPixmap = clientCon->accelAssistPixmaps[index];
-        if (pPixmap != NULL)
+        int buf;
+
+        for (buf = 0; buf < 2; buf++)
         {
-            pScreen->DestroyPixmap(pPixmap);
+            pPixmap = clientCon->accelAssistPixmaps[index][buf];
+            if (pPixmap != NULL)
+            {
+                pScreen->DestroyPixmap(pPixmap);
+                clientCon->accelAssistPixmaps[index][buf] = NULL;
+            }
+            if (clientCon->accelAssistPending[index][buf] != NULL)
+            {
+                rdpRegionDestroy(clientCon->accelAssistPending[index][buf]);
+                clientCon->accelAssistPending[index][buf] = NULL;
+            }
         }
     }
     clientCon->accel_assist_pid = -1;
     clientCon->use_accel_assist = 0;
     return exit_code;
+}
+
+/******************************************************************************/
+/* Is AVC444 in effect for this connection?
+
+   Normally this is whatever the client negotiated, which xrdp worked out
+   from the confirmed EGFX capability set and passed down in
+   client_info.gfx_avc444. XRDP_ACCEL_AVC444 overrides it, tri-state:
+
+     unset  follow what the client negotiated
+     "0"    force AVC444 off, whatever the client supports
+     other  force AVC444 on
+
+   The accel-assist helper applies the same rule to the same variable, so
+   the codec id asked for here and the encoder the helper builds cannot
+   disagree. An off switch has to exist now that negotiation can turn
+   AVC444 on by itself, and it cannot be a presence test, or "=0" -- the
+   obvious spelling -- would turn it on. */
+static Bool
+rdpClientConAvc444(rdpClientCon *clientCon)
+{
+    const char *env = getenv("XRDP_ACCEL_AVC444");
+
+    if (env != NULL)
+    {
+        return strcmp(env, "0") != 0;
+    }
+    return clientCon->client_info.gfx_avc444 != 0;
+}
+
+/******************************************************************************/
+/* Is the v2 chroma layout in effect?
+
+   client_info.gfx_avc444 carries the level xrdp derived from the confirmed
+   capability set: 2 means the v2 layout, 1 means hold to v1. There is no
+   capability flag for this in MS-RDPEGFX, so the version is all xrdp has to
+   go on and the choice is finally the server's. XRDP_ACCEL_AVC444_V2
+   overrides, tri-state like XRDP_ACCEL_AVC444 above. */
+static Bool
+rdpClientConAvc444V2(rdpClientCon *clientCon)
+{
+    const char *env = getenv("XRDP_ACCEL_AVC444_V2");
+
+    if (env != NULL)
+    {
+        return strcmp(env, "0") != 0;
+    }
+    /* An xrdp that predates the level-carrying gfx_avc444 sets it to 1 for
+       any AVC444-capable client, so treating "not 2" as "v1" silently
+       downgrades a whole session on a mixed build. Only hold to v1 when the
+       peer actually said 1 while knowing about levels; a plain 1 from an
+       older peer keeps the previous default, which was v2. */
+    if (clientCon->client_info.version >= XUP_CLIENT_INFO_LEVEL_AVC444_VERSION)
+    {
+        return clientCon->client_info.gfx_avc444 >= 2;
+    }
+    return clientCon->client_info.gfx_avc444 != 0;
 }
 
 /******************************************************************************/
@@ -888,6 +957,7 @@ rdpClientConResizeAllMemoryAreas(rdpPtr dev, rdpClientCon *clientCon)
             shmemstatus = SHM_RFX_ACTIVE_PENDING;
 
             dev->msFrameInterval = clientCon->client_info.rfx_frame_interval;
+            clientCon->msFrameInterval = dev->msFrameInterval;
             break;
         case CC_SUF_A2: /* H264 */
         case CC_GFX_A2:
@@ -903,6 +973,7 @@ rdpClientConResizeAllMemoryAreas(rdpPtr dev, rdpClientCon *clientCon)
             shmemstatus = SHM_H264_ACTIVE_PENDING;
 
             dev->msFrameInterval = clientCon->client_info.h264_frame_interval;
+            clientCon->msFrameInterval = dev->msFrameInterval;
             break;
         default:
             LOG(LOG_LEVEL_INFO,
@@ -917,11 +988,55 @@ rdpClientConResizeAllMemoryAreas(rdpPtr dev, rdpClientCon *clientCon)
             shmemstatus = SHM_ACTIVE_PENDING;
 
             dev->msFrameInterval = clientCon->client_info.normal_frame_interval;
+            clientCon->msFrameInterval = dev->msFrameInterval;
             break;
     }
 
     LOG(LOG_LEVEL_INFO,
         "    msFrameInterval %ld", (long)dev->msFrameInterval);
+    {
+        const char *ap = getenv("XORGXRDP_ADAPTIVE_PACE");
+        const char *pmin = getenv("XORGXRDP_PACE_MIN_MS");
+        const char *pmax = getenv("XORGXRDP_PACE_MAX_MS");
+
+        const char *cd = getenv("XORGXRDP_CAPTURE_DEPTH");
+
+        /* One by default. Two lets the next frame be captured while the
+           previous is still in flight; safe now that each buffer is given
+           the damage it missed as well as the current frame's, so the
+           full-frame AVC444 auxiliary pass never reads a stale pixel. */
+        clientCon->capture_depth = (cd != NULL) ? atoi(cd) : 1;
+        if (clientCon->capture_depth < 1)
+        {
+            clientCon->capture_depth = 1;
+        }
+        if (clientCon->capture_depth > 2)
+        {
+            clientCon->capture_depth = 2;
+        }
+        clientCon->pace_enabled = (ap != NULL && atoi(ap) != 0);
+        /* The floor defaults to 20 ms because the RandR mode xorgxrdp
+           advertises is 50 Hz (rdpRandR.c), so a vsync-aware application
+           cannot paint faster than that -- probing below the source's own
+           rate only spends capture attempts that find nothing changed. */
+        clientCon->pace_min_ms = (pmin != NULL) ? atoi(pmin) : 20;
+        clientCon->pace_max_ms = (pmax != NULL) ? atoi(pmax) : 100;
+        if (clientCon->pace_min_ms < 1)
+        {
+            clientCon->pace_min_ms = 1;
+        }
+        if (clientCon->pace_max_ms < clientCon->pace_min_ms)
+        {
+            clientCon->pace_max_ms = clientCon->pace_min_ms;
+        }
+        if (clientCon->pace_enabled)
+        {
+            LOG(LOG_LEVEL_INFO, "    capture depth %d",
+            clientCon->capture_depth);
+        LOG(LOG_LEVEL_INFO, "    adaptive pacing on, interval %d-%d ms",
+                clientCon->pace_min_ms, clientCon->pace_max_ms);
+        }
+    }
     rdpClientConAllocateSharedMemory(clientCon, bytes);
 
     if (clientCon->client_info.capture_format != 0)
@@ -1189,6 +1304,7 @@ rdpSendAccelAssistMonitors(rdpPtr dev, rdpClientCon *clientCon)
     int rv;
     int width;
     int height;
+    int caps;
     const int layer_size = 8;
 
     LOG(LOG_LEVEL_INFO, "rdpSendAccelAssistMonitors: monitorCount %d",
@@ -1199,6 +1315,39 @@ rdpSendAccelAssistMonitors(rdpPtr dev, rdpClientCon *clientCon)
     out_uint16_le(clientCon->out_s, 1); /* clear monitors */
     out_uint16_le(clientCon->out_s, 4); /* size */
     clientCon->count++;
+
+    /* Session capabilities, ahead of the pixmap creates below because the
+       helper's encoder geometry depends on them: the two AVC444 views are
+       pictures of one H.264 sequence and must share a 16-aligned height,
+       which is fixed when the pixmap is created. An older helper skips this
+       message on its size field and simply never enables AVC444.
+
+       Sub-message ids in the type-100 batch are shared with xrdp, because
+       accel-assist forwards the whole batch on after processing it and
+       xrdp's lib_mod_process_message parses the same bytes. 1 is clear
+       monitors, 2 is add monitor, 3 is memory allocation complete (which
+       xrdp acts on -- reusing it here fed a capability word to
+       server_monitor_resize_done as a width and height and crashed xrdp),
+       so this is 4. Both parsers skip ids they do not know using the size
+       field. */
+    caps = 0;
+    if (rdpClientConAvc444(clientCon))
+    {
+        caps |= XH_CAPS_AVC444;
+        if (rdpClientConAvc444V2(clientCon))
+        {
+            caps |= XH_CAPS_AVC444_V2;
+        }
+    }
+    out_uint16_le(clientCon->out_s, 4);  /* session capabilities */
+    out_uint16_le(clientCon->out_s, 8);  /* size */
+    out_uint32_le(clientCon->out_s, caps);
+    clientCon->count++;
+    LOG(LOG_LEVEL_INFO, "rdpSendAccelAssistMonitors: capabilities 0x%8.8x "
+        "(AVC444 %s)", caps,
+        (caps & XH_CAPS_AVC444)
+        ? ((caps & XH_CAPS_AVC444_V2) ? "v2 negotiated" : "v1 negotiated")
+        : "not negotiated");
     if (dev->monitorCount < 1)
     {
         width = dev->width;
@@ -1489,6 +1638,21 @@ rdpClientConProcessMsgClientInfo(rdpPtr dev, rdpClientCon *clientCon)
                                clientCon->rdp_height);
 
     /* currently only nvenc and h264 is supported */
+    {
+        const char *t = getenv("XORGXRDP_TIMING");
+        const char *d = getenv("XORGXRDP_CAPTURE_DRAIN");
+        clientCon->timing.enabled = (t != NULL && strcmp(t, "0") != 0);
+        clientCon->timing.force_drain = (d != NULL && strcmp(d, "0") != 0);
+        if (clientCon->timing.force_drain)
+        {
+            LOG(LOG_LEVEL_INFO, "rdpClientConGotConnection: capture will "
+                "drain the GPU rather than flush");
+        }
+        if (clientCon->timing.enabled)
+        {
+            LOG(LOG_LEVEL_INFO, "rdpClientConGotConnection: frame timing on");
+        }
+    }
     if (rdpClientConUseAccelAssist(dev, clientCon))
     {
         clientCon->use_accel_assist = 1;
@@ -1543,6 +1707,135 @@ rdpClientConProcessMsgClientRegion(rdpPtr dev, rdpClientCon *clientCon)
 }
 
 /******************************************************************************/
+/* Adaptive capture pacing, steered by the client's own round trip.
+
+   msFrameInterval is the minimum spacing between captures. Fixed, it has to
+   be tuned to the slowest client that will connect and then throttles every
+   other client sharing the session. Measured on one host at 2688x1488, same
+   session and same content: a native client answered in 11-16 ms while a
+   browser client answered in 222-289 ms. No single constant serves both.
+
+   The signal is the round trip xrdp measures from its own send to the
+   client's acknowledgement, sent down with each ack. It must be that figure
+   and not the send-to-ack gap this file can measure locally: the local one
+   runs from OUR send, and we do not send again until msFrameInterval has
+   elapsed, so it contains the very interval being set. An earlier version of
+   this loop used it and wound itself up to the ceiling -- raising the
+   interval raised the signal that decides whether to raise it. Verified
+   against both clients before this was rebuilt: the local gap read 18-20 ms
+   while the true client latency ranged 1-13, and under load the true figure
+   moved 20x where the local one moved 4x.
+
+   Steer towards the smoothed round trip: a client answering in N ms can
+   accept a frame every N ms. Move a quarter of the way each time, in both
+   directions, so recovering costs what backing off did. Back off on the
+   first bad sample, take rate back only after a sustained good run. */
+static void
+rdpClientConPaceUpdate(rdpClientCon *clientCon, int rtt)
+{
+    int interval;
+    int target;
+
+    if (!clientCon->pace_enabled || rtt <= 0)
+    {
+        return;
+    }
+    /* EWMA with a quarter weight on the new sample. Single frames are noisy
+       -- a scene change or a pause in the client shows up as one large
+       round trip -- and reacting to those would make the interval jitter. */
+    if (clientCon->pace_rtt_ms == 0)
+    {
+        clientCon->pace_rtt_ms = rtt;
+    }
+    else
+    {
+        /* Outliers are discarded rather than scaled down. Measured on a
+           browser client, the round trip sits in the teens with isolated
+           frames at 100-300 and occasionally over 1000 -- a scene change, or
+           the client's own scheduler. Averaging those in holds the interval
+           far above what the client needs.
+
+           An earlier version clamped a sample to twice the current average
+           instead. That ratchets: the clamp is relative to a value it is
+           itself inflating, so each admitted spike raises the ceiling for the
+           next one and a burst walks the average up geometrically. The
+           interval then oscillated between the floor and 68 ms while the true
+           round trip stayed inside a 10-54 ms band.
+
+           A sample more than four times the average is treated as an event
+           rather than a measurement and dropped. A real slowdown persists,
+           and once four in a row have been dropped the average is plainly
+           wrong, so it is reseeded from the current sample. */
+        if (rtt > clientCon->pace_rtt_ms * 4 && clientCon->pace_rtt_ms > 0)
+        {
+            /* Too far above the average to be a measurement of the steady
+               state -- a scene change, or the client's own scheduler. Damped
+               rather than discarded: an outright reject means a genuine
+               slowdown is invisible while it is happening. Measured on a
+               browser client the average sat near 16 ms and real degradation
+               ran to 65-77, which is inside the rejected band, so the
+               interval stayed at 17 ms while the round trip was 65. A
+               sixteenth of the way still lets sustained elevation register
+               within a few frames, while a lone spike barely moves it. */
+            clientCon->pace_rtt_ms += (rtt - clientCon->pace_rtt_ms) / 16;
+        }
+        else
+        {
+            clientCon->pace_rtt_ms += (rtt - clientCon->pace_rtt_ms) / 4;
+        }
+    }
+    /* Let the average fill before steering by it. The first frames of a
+       session carry the initial full-screen update, whose round trip is not
+       representative of anything. */
+    if (clientCon->pace_samples < 32)
+    {
+        clientCon->pace_samples++;
+        return;
+    }
+    interval = (int) clientCon->msFrameInterval;
+    target = clientCon->pace_rtt_ms;
+    if (target < clientCon->pace_min_ms)
+    {
+        target = clientCon->pace_min_ms;
+    }
+    if (target > clientCon->pace_max_ms)
+    {
+        target = clientCon->pace_max_ms;
+    }
+    if (target > interval)
+    {
+        /* Behind: give ground at once. */
+        clientCon->msFrameInterval = interval + (target - interval + 3) / 4;
+        clientCon->pace_good_run = 0;
+    }
+    else if (target < interval)
+    {
+        /* Keeping up: take ground only after a sustained run, so a brief
+           quiet patch does not pull the interval into a region that
+           thrashes. Probing down is an experiment, not a target -- a client
+           answering in 13 ms at 30 fps is not evidence it can serve 60 --
+           so if the rate proves too high the round trip grows and the branch
+           above gives it straight back. */
+        clientCon->pace_good_run++;
+        /* Four, not sixteen. With a spike in most hundred-frame windows a
+           sixteen-ack run rarely completed, so the interval descended a few
+           milliseconds per window and never reached the floor -- it spent
+           the session climbing back from spikes. */
+        if (clientCon->pace_good_run >= 4)
+        {
+            clientCon->pace_good_run = 0;
+            clientCon->msFrameInterval = interval - (interval - target + 3) / 4;
+        }
+    }
+    if ((int) clientCon->msFrameInterval != interval)
+    {
+        LOG(LOG_LEVEL_DEBUG, "rdpClientConPaceUpdate: interval %d -> %d ms "
+            "(smoothed client rtt %d ms)", interval,
+            (int) clientCon->msFrameInterval, clientCon->pace_rtt_ms);
+    }
+}
+
+/******************************************************************************/
 static int
 rdpClientConProcessMsgClientRegionEx(rdpPtr dev, rdpClientCon *clientCon)
 {
@@ -1558,6 +1851,87 @@ rdpClientConProcessMsgClientRegionEx(rdpPtr dev, rdpClientCon *clientCon)
     {
         // Client just wishes to ack all in-flight frames
         clientCon->rect_id_ack = clientCon->rect_id;
+    }
+    /* Round trip from xrdp's send to the client's acknowledgement, appended
+       to this message by newer xrdp builds. Absent from an older peer, hence
+       the remaining-bytes check. Zero means unknown.
+
+       Worth the plumbing because it is the only latency figure here that does
+       not contain the capture interval: an attempt to pace capture by the
+       send-to-ack gap measured locally fed the interval back into its own
+       input and settled against the ceiling. */
+    if (s->end - s->p >= 4)
+    {
+        int crtt;
+
+        in_uint32_le(s, crtt);
+        rdpClientConPaceUpdate(clientCon, crtt);
+        if (crtt > 0)
+        {
+            clientCon->timing.crtt_total_ms += crtt;
+            clientCon->timing.crtt_count++;
+            if (crtt > clientCon->timing.crtt_max_ms)
+            {
+                clientCon->timing.crtt_max_ms = crtt;
+            }
+        }
+    }
+    if (clientCon->timing.enabled && clientCon->timing.sent_ms != 0)
+    {
+        CARD32 sent = clientCon->timing.send_time[clientCon->rect_id_ack %
+                                                  RDP_SEND_TIME_SLOTS];
+        int gap;
+
+        if (sent == 0)
+        {
+            sent = clientCon->timing.sent_ms;
+        }
+        gap = (int) (GetTimeInMillis() - sent);
+
+        clientCon->timing.ack_total_ms += gap;
+        if (gap > clientCon->timing.ack_max_ms)
+        {
+            clientCon->timing.ack_max_ms = gap;
+        }
+        clientCon->timing.count++;
+        if (clientCon->timing.count >= 100)
+        {
+            struct rdp_timing *t = &clientCon->timing;
+
+            LOG(LOG_LEVEL_INFO, "xorgxrdp frame timing over %d frames: "
+                "capture mean %d ms max %d, handoff mean %d ms max %d, "
+                "send->ack mean %d ms max %d, blocked callbacks %d, "
+                "capture split: blit mean %d ms, gpu-drain mean %d ms, "
+                "idle mean %d ms max %d, inflight %d/100, sent %d, "
+                "no-op callbacks %d, client rtt mean %d ms max %d, "
+                "interval %d ms",
+                t->count,
+                t->capture_total_ms / t->count, t->capture_max_ms,
+                t->send_total_ms / t->count, t->send_max_ms,
+                t->ack_total_ms / t->count, t->ack_max_ms,
+                t->blocked,
+                t->blit_count ? t->blit_total_ms / t->blit_count : 0,
+                t->blit_count ? t->sync_total_ms / t->blit_count : 0,
+                t->capture_count ? t->idle_total_ms / t->capture_count : 0,
+                t->idle_max_ms,
+                t->capture_count
+                    ? t->inflight_total * 100 / t->capture_count : 0,
+                t->capture_count, t->damage_starved,
+                t->crtt_count ? t->crtt_total_ms / t->crtt_count : 0,
+                t->crtt_max_ms, (int) clientCon->msFrameInterval);
+            t->count = 0;
+            t->capture_total_ms = 0; t->capture_max_ms = 0;
+            t->send_total_ms = 0; t->send_max_ms = 0;
+            t->ack_total_ms = 0; t->ack_max_ms = 0;
+            t->blocked = 0;
+            t->blit_total_ms = 0;
+            t->sync_total_ms = 0; t->blit_count = 0;
+            t->idle_total_ms = 0; t->idle_max_ms = 0;
+            t->inflight_total = 0; t->damage_starved = 0;
+            t->capture_count = 0;
+            t->crtt_total_ms = 0; t->crtt_max_ms = 0;
+            t->crtt_count = 0;
+        }
     }
     LOG(LOG_LEVEL_TRACE,
         "rdpClientConProcessMsgClientRegionEx: flags 0x%8.8x", flags);
@@ -1902,7 +2276,7 @@ rdpClientConInit(rdpPtr dev)
     }
 
     set_sock_name(dev->uds_data, sizeof(dev->uds_data),
-                  "XRDP_X11RDP_SOCKET", "xrdp_display_%s", display);
+                  "XRDP_X11RDP_SOCKET", "xrdp_display_X11-%s", display);
 
     if (dev->listen_sck == 0)
     {
@@ -1920,7 +2294,7 @@ rdpClientConInit(rdpPtr dev)
 
     set_sock_name(dev->disconnect_uds, sizeof(dev->disconnect_uds),
                   "XRDP_DISCONNECT_SOCKET",
-                  "xrdp_disconnect_display_%s", display);
+                  "xrdp_disconnect_display_X11-%s", display);
 
     if (dev->disconnect_sck == 0)
     {
@@ -3181,7 +3555,13 @@ rdpClientConSendPaintRectShmFd(rdpPtr dev, rdpClientCon *clientCon,
         out_uint16_le(s, 0);                    /* flags */
         out_uint32_le(s, wiretosurface1_bytes); /* cmd_bytes */
         out_uint16_le(s, surface_id);           /* surface_id */
-        out_uint16_le(s, 0x000B);               /* codec_id */
+        /* AVC444 (0x000E) when the client negotiated it, else AVC420
+           (0x000B). The accel-assist helper was told the same thing by the
+           capability message, so its encoder is already sized for whichever
+           we ask for here. */
+        out_uint16_le(s, clientCon->use_accel_assist &&
+                         rdpClientConAvc444(clientCon)
+                         ? 0x000E : 0x000B);    /* codec_id */
         out_uint8(s, 0x20);                     /* pixel_format */
 
         out_uint32_le(s, id->flags);            /* flags */
@@ -3255,8 +3635,10 @@ rdpCapRect(rdpClientCon *clientCon, BoxPtr cap_rect, int mon,
         num_rects = 0;
         LOG(LOG_LEVEL_TRACE, "rdpCapRect: capture_code %d",
             clientCon->client_info.capture_code);
+        CARD32 t0 = clientCon->timing.enabled ? GetTimeInMillis() : 0;
         if (rdpCapture(clientCon, cap_dirty, &rects, &num_rects, id))
         {
+            CARD32 t1 = clientCon->timing.enabled ? GetTimeInMillis() : 0;
             LOG(LOG_LEVEL_TRACE, "rdpCapRect: num_rects %d", num_rects);
             if (clientCon->send_key_frame[mon])
             {
@@ -3266,6 +3648,44 @@ rdpCapRect(rdpClientCon *clientCon, BoxPtr cap_rect, int mon,
             }
             rdpClientConSendPaintRectShmFd(clientCon->dev, clientCon, id,
                                            cap_dirty, rects, num_rects);
+            if (clientCon->timing.enabled)
+            {
+                CARD32 t2 = GetTimeInMillis();
+                int cap = (int) (t1 - t0);
+                int snd = (int) (t2 - t1);
+
+                clientCon->timing.capture_total_ms += cap;
+                clientCon->timing.send_total_ms += snd;
+                if (cap > clientCon->timing.capture_max_ms)
+                {
+                    clientCon->timing.capture_max_ms = cap;
+                }
+                if (snd > clientCon->timing.send_max_ms)
+                {
+                    clientCon->timing.send_max_ms = snd;
+                }
+                /* Dead time since the previous frame went out: the part
+                   of the period no stage accounts for. Measured here, not
+                   where the callback commits to a capture, because the ack
+                   handler schedules a callback unconditionally and most of
+                   those find nothing dirty and send nothing. */
+                if (clientCon->timing.sent_ms != 0)
+                {
+                    int idle = (int) (t0 - clientCon->timing.sent_ms);
+
+                    clientCon->timing.idle_total_ms += idle;
+                    if (idle > clientCon->timing.idle_max_ms)
+                    {
+                        clientCon->timing.idle_max_ms = idle;
+                    }
+                }
+                clientCon->timing.inflight_total +=
+                    clientCon->rect_id - clientCon->rect_id_ack;
+                clientCon->timing.capture_count++;
+                clientCon->timing.sent_ms = t2;
+                clientCon->timing.send_time[clientCon->rect_id %
+                                            RDP_SEND_TIME_SLOTS] = t2;
+            }
             free(rects);
         }
         else
@@ -3289,6 +3709,7 @@ rdpDeferredUpdateCallback(OsTimerPtr timer, CARD32 now, pointer arg)
     int index;
     int monitor_index;
     int monitor_count;
+    int depth;
     BoxRec cap_rect;
 
     LOG(LOG_LEVEL_TRACE, "rdpDeferredUpdateCallback:");
@@ -3306,10 +3727,17 @@ rdpDeferredUpdateCallback(OsTimerPtr timer, CARD32 now, pointer arg)
             clientCon->shmemstatus, clientCon->rect_id, clientCon->rect_id_ack);
         return 0;
     }
-    if ((clientCon->rect_id > clientCon->rect_id_ack) ||
+    depth = 1;
+    if (clientCon->use_accel_assist &&
+        clientCon->accelAssistPixmaps[0][1] != NULL)
+    {
+        depth = clientCon->capture_depth;
+    }
+    if ((clientCon->rect_id - clientCon->rect_id_ack >= depth) ||
         /* do not allow captures until we have the client_info */
         clientCon->client_info.size == 0)
     {
+        clientCon->timing.blocked++;
         return 0;
     }
     clientCon->lastUpdateTime = now;
@@ -3335,7 +3763,7 @@ rdpDeferredUpdateCallback(OsTimerPtr timer, CARD32 now, pointer arg)
         while (monitor_index < monitor_count)
         {
             // Did we get anything from the last monitor?
-            if (clientCon->rect_id > clientCon->rect_id_ack)
+            if (clientCon->rect_id - clientCon->rect_id_ack >= depth)
             {
                 LOG(LOG_LEVEL_TRACE,
                     "rdpDeferredUpdateCallback: reschedule rect_id %d "
@@ -3370,6 +3798,10 @@ rdpDeferredUpdateCallback(OsTimerPtr timer, CARD32 now, pointer arg)
     {
         rdpScheduleDeferredUpdate(clientCon);
     }
+    else if (clientCon->timing.enabled)
+    {
+        clientCon->timing.damage_starved++;
+    }
 
     return 0;
 }
@@ -3392,7 +3824,8 @@ rdpScheduleDeferredUpdate(rdpClientCon *clientCon)
        for more changes before sending an update. Always waiting the longer
        delay would introduce unnecessarily much latency. */
     msToWait = MIN_MS_TO_WAIT_FOR_MORE_UPDATES;
-    minNextUpdateTime = clientCon->lastUpdateTime + clientCon->dev->msFrameInterval;
+    minNextUpdateTime = clientCon->lastUpdateTime +
+                        clientCon->msFrameInterval;
     /* the first check is to gracefully handle the infrequent case of
        the time wrapping around */
     if(clientCon->lastUpdateTime < curTime &&

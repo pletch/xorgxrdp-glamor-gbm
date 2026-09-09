@@ -726,7 +726,8 @@ static Bool
 rdpCopyBoxList(rdpClientCon *clientCon, PixmapPtr dstPixmap,
                BoxPtr out_rects, int num_out_rects,
                int srcx, int srcy,
-               int dstx, int dsty)
+               int dstx, int dsty,
+               int cpu_read)
 {
     PixmapPtr hwPixmap;
     BoxPtr pbox;
@@ -741,8 +742,10 @@ rdpCopyBoxList(rdpClientCon *clientCon, PixmapPtr dstPixmap,
     int height;
     char pix1[16];
     rdpPtr dev;
+    CARD32 t_start;
 
     LOG(LOG_LEVEL_TRACE, "rdpCopyBoxList:");
+    t_start = clientCon->timing.enabled ? GetTimeInMillis() : 0;
 
     dev = clientCon->dev;
     pScreen = dev->pScreen;
@@ -773,8 +776,59 @@ rdpCopyBoxList(rdpClientCon *clientCon, PixmapPtr dstPixmap,
         }
     }
     FreeScratchGC(copyGC);
-    pScreen->GetImage(&(dstPixmap->drawable), 0, 0, 1, 1, ZPixmap,
-                          0xffffffff, pix1);
+
+    /* Make the copy visible to whoever reads it next.
+
+       cpu_read: the caller is about to read the destination with the CPU --
+       the vmem-to-smem paths do exactly that -- so the copy has to have
+       landed. A 1x1 GetImage forces it, at the cost of draining the whole
+       GPU pipeline.
+
+       Otherwise the reader is accel-assist, in another process and another
+       GL context, and a flush is enough: both sides are Mesa GL on the same
+       DRM device, so once our commands are submitted the kernel orders its
+       reads of the shared buffer after our writes through the buffer's
+       implicit fences. That is the same reasoning that let accel-assist use
+       glFlush rather than glFinish before handing a surface to VAAPI.
+
+       This matters: measured on a 3008x2000 desktop, the blits cost 0 ms
+       and the drain 10-19 ms -- about a quarter of the whole frame period
+       spent waiting for a pipeline we did not need to wait for.
+       XORGXRDP_CAPTURE_DRAIN=1 restores the old behaviour. */
+    if (cpu_read || clientCon->timing.force_drain)
+    {
+        if (clientCon->timing.enabled)
+        {
+            CARD32 tc = GetTimeInMillis();
+
+            clientCon->timing.blit_total_ms += (int) (tc - t_start);
+            pScreen->GetImage(&(dstPixmap->drawable), 0, 0, 1, 1, ZPixmap,
+                              0xffffffff, pix1);
+            clientCon->timing.sync_total_ms += (int) (GetTimeInMillis() - tc);
+            clientCon->timing.blit_count++;
+        }
+        else
+        {
+            pScreen->GetImage(&(dstPixmap->drawable), 0, 0, 1, 1, ZPixmap,
+                              0xffffffff, pix1);
+        }
+    }
+    else
+    {
+        if (clientCon->timing.enabled)
+        {
+            CARD32 tc = GetTimeInMillis();
+
+            clientCon->timing.blit_total_ms += (int) (tc - t_start);
+            glamor_block_handler(pScreen);
+            clientCon->timing.sync_total_ms += (int) (GetTimeInMillis() - tc);
+            clientCon->timing.blit_count++;
+        }
+        else
+        {
+            glamor_block_handler(pScreen);
+        }
+    }
 
     return TRUE;
 }
@@ -860,7 +914,7 @@ rdpCaptureSimple(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
         /* copy vmem to smem */
         if (!rdpCopyBoxList(clientCon, clientCon->dev->screenSwPixmap,
                             *out_rects, *num_out_rects,
-                            0, 0, 0, 0))
+                            0, 0, 0, 0, 1))
         {
             return FALSE;
         }
@@ -1019,7 +1073,7 @@ rdpCaptureSufA16(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
         /* copy vmem to smem */
         if (!rdpCopyBoxList(clientCon, clientCon->dev->screenSwPixmap,
                             *out_rects, *num_out_rects,
-                            0, 0, 0, 0))
+                            0, 0, 0, 0, 1))
         {
             return FALSE;
         }
@@ -1115,7 +1169,7 @@ rdpCaptureGfxPro(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
         /* copy vmem to smem */
         if (!rdpCopyBoxList(clientCon, clientCon->dev->screenSwPixmap,
                             REGION_RECTS(in_reg), REGION_NUM_RECTS(in_reg),
-                            0, 0, 0, 0))
+                            0, 0, 0, 0, 1))
         {
             return FALSE;
         }
@@ -1240,6 +1294,111 @@ rdpCaptureGfxPro(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
 }
 
 /******************************************************************************/
+/* Pick the capture buffer for this frame and work out what must be copied
+   into it.
+
+   Returns the buffer index. When two buffers are in use, *owed is set to a
+   region covering the current damage plus everything this buffer has missed
+   since it was last written; the caller copies that and destroys it. The
+   region is NULL when there is only one buffer, which needs no such
+   bookkeeping because it accumulates every box ever copied.
+
+   The debt is what makes capture-ahead safe for the full-frame AVC444
+   auxiliary view. Without it each buffer holds only the boxes that happened
+   to land in it, and the auxiliary pass reads stale pixels everywhere else. */
+static int
+rdpCaptureAccelAssistBuffer(rdpClientCon *clientCon, int monitor_index,
+                            RegionPtr in_reg, struct image_data *id,
+                            RegionPtr *owed, BoxPtr *owed_rects,
+                            int *num_owed_rects)
+{
+    int buf_index;
+    int other;
+    RegionPtr pending;
+
+    *owed = NULL;
+    *owed_rects = NULL;
+    *num_owed_rects = 0;
+    if (clientCon->capture_depth < 2 ||
+        clientCon->accelAssistPixmaps[monitor_index][1] == NULL)
+    {
+        /* One buffer: stay on zero, which converges on the whole screen. */
+        return 0;
+    }
+    buf_index = clientCon->accelAssistBuf[monitor_index];
+    other = buf_index ^ 1;
+    clientCon->accelAssistBuf[monitor_index] = other;
+    if (buf_index)
+    {
+        id->flags |= ACCEL_ASSIST_BUFFER_1;
+    }
+    else
+    {
+        id->flags &= ~ACCEL_ASSIST_BUFFER_1;
+    }
+    /* What this buffer owes, plus what is dirty now. */
+    *owed = rdpRegionCreate(NullBox, 0);
+    rdpRegionCopy(*owed, in_reg);
+    pending = clientCon->accelAssistPending[monitor_index][buf_index];
+    if (pending != NULL)
+    {
+        rdpRegionUnion(*owed, *owed, pending);
+        rdpRegionDestroy(pending);
+    }
+
+    clientCon->accelAssistPending[monitor_index][buf_index] =
+        rdpRegionCreate(NullBox, 0);
+    /* The other buffer now owes this frame's damage as well. */
+    pending = clientCon->accelAssistPending[monitor_index][other];
+    if (pending == NULL)
+    {
+        pending = rdpRegionCreate(NullBox, 0);
+        clientCon->accelAssistPending[monitor_index][other] = pending;
+    }
+    rdpRegionUnion(pending, pending, in_reg);
+    /* Grown to even boundaries, the way the rects sent to the client are.
+       Chroma is half resolution, so an odd edge leaves the far half of a
+       chroma sample unwritten -- a one pixel seam the full-frame auxiliary
+       pass reads as stale. Copying slightly more is always safe; copying
+       slightly less is the bug. */
+    {
+        BoxPtr src;
+        int count;
+        int i;
+
+        count = REGION_NUM_RECTS(*owed);
+        src = REGION_RECTS(*owed);
+        *owed_rects = (BoxPtr) malloc(sizeof(BoxRec) * count);
+        if (*owed_rects == NULL)
+        {
+            rdpRegionDestroy(*owed);
+            *owed = NULL;
+            return buf_index;
+        }
+        for (i = 0; i < count; i++)
+        {
+            BoxRec r = src[i];
+
+            r.x1 -= r.x1 & 1;
+            r.y1 -= r.y1 & 1;
+            r.x2 += r.x2 & 1;
+            r.y2 += r.y2 & 1;
+            if (r.x2 > id->width)
+            {
+                r.x2 = id->width & ~1;
+            }
+            if (r.y2 > id->height)
+            {
+                r.y2 = id->height & ~1;
+            }
+            (*owed_rects)[i] = r;
+        }
+        *num_owed_rects = count;
+    }
+    return buf_index;
+}
+
+/******************************************************************************/
 /* make out_rects always multiple of 2 width and height */
 static Bool
 rdpCaptureSufA2(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
@@ -1279,13 +1438,34 @@ rdpCaptureSufA2(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
     }
 
     monitor_index = (id->flags >> 28) & 0xF;
-    if (clientCon->accelAssistPixmaps[monitor_index] != NULL)
+    if (clientCon->accelAssistPixmaps[monitor_index][0] != NULL)
     {
+        BoxPtr copy_rects = *out_rects;
+        int num_copy_rects = *num_out_rects;
+        BoxPtr owed_rects = NULL;
+        int num_owed_rects = 0;
+        RegionPtr owed = NULL;
+        int buf_index;
+
+        buf_index = rdpCaptureAccelAssistBuffer(clientCon, monitor_index,
+                                                in_reg, id, &owed,
+                                                &owed_rects, &num_owed_rects);
+        if (owed_rects != NULL)
+        {
+            copy_rects = owed_rects;
+            num_copy_rects = num_owed_rects;
+        }
         /* copy vmem to vmem */
         rv = rdpCopyBoxList(clientCon,
-                            clientCon->accelAssistPixmaps[monitor_index],
-                            *out_rects, *num_out_rects,
-                            0, 0, id->left, id->top);
+                            clientCon->accelAssistPixmaps[monitor_index]
+                            [buf_index],
+                            copy_rects, num_copy_rects,
+                            0, 0, id->left, id->top, 0);
+        if (owed != NULL)
+        {
+            rdpRegionDestroy(owed);
+        }
+        free(owed_rects);
         id->flags |= 1;
         return rv;
         /* accel assist will do the rest */
@@ -1295,7 +1475,7 @@ rdpCaptureSufA2(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
         /* copy vmem to smem */
         rv = rdpCopyBoxList(clientCon, clientCon->dev->screenSwPixmap,
                             *out_rects, *num_out_rects,
-                            0, 0, id->left, id->top);
+                            0, 0, id->left, id->top, 1);
     }
 
     *num_out_rects = num_rects;
@@ -1416,16 +1596,37 @@ rdpCaptureGfxA2(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
     }
     rv = TRUE;
     monitor_index = (id->flags >> 28) & 0xF;
-    if (clientCon->accelAssistPixmaps[monitor_index] != NULL)
+    if (clientCon->accelAssistPixmaps[monitor_index][0] != NULL)
     {
+        BoxPtr copy_rects = *out_rects;
+        int num_copy_rects = num_rects;
+        BoxPtr owed_rects = NULL;
+        int num_owed_rects = 0;
+        RegionPtr owed = NULL;
+        int buf_index;
+
+        buf_index = rdpCaptureAccelAssistBuffer(clientCon, monitor_index,
+                                                in_reg, id, &owed,
+                                                &owed_rects, &num_owed_rects);
+        if (owed_rects != NULL)
+        {
+            copy_rects = owed_rects;
+            num_copy_rects = num_owed_rects;
+        }
         LOG(LOG_LEVEL_TRACE,
-            "rdpCaptureGfxA2: a monitor_index %d left %d top %d",
-            monitor_index, id->left, id->top);
+            "rdpCaptureGfxA2: a monitor_index %d left %d top %d buf %d",
+            monitor_index, id->left, id->top, buf_index);
         /* copy vmem to vmem */
         rv = rdpCopyBoxList(clientCon,
-                            clientCon->accelAssistPixmaps[monitor_index],
-                            *out_rects, num_rects,
-                            -id->left, -id->top, 0, 0);
+                            clientCon->accelAssistPixmaps[monitor_index]
+                            [buf_index],
+                            copy_rects, num_copy_rects,
+                            -id->left, -id->top, 0, 0, 0);
+        if (owed != NULL)
+        {
+            rdpRegionDestroy(owed);
+        }
+        free(owed_rects);
         id->flags |= 1;
         return rv;
         /* accel assist will do the rest */
@@ -1439,7 +1640,7 @@ rdpCaptureGfxA2(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
         if (!rdpCopyBoxList(clientCon,
                             clientCon->dev->screenSwPixmap,
                             *out_rects, num_rects,
-                            -id->left, -id->top, -id->left, -id->top))
+                            -id->left, -id->top, -id->left, -id->top, 1))
         {
             return FALSE;
         }

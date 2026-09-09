@@ -86,7 +86,11 @@ rdpPutImage(DrawablePtr pDst, GCPtr pGC, int depth, int x, int y,
                 {
                     /* free old */
                     int monitor_index = pBits32[2] & 0xF;
-                    pixmap = clientCon->accelAssistPixmaps[monitor_index];
+                    /* the helper puts the capture-buffer index above the
+                       monitor index in the same word */
+                    int buf_index = (pBits32[2] >> 8) & 1;
+                    pixmap = clientCon->accelAssistPixmaps[monitor_index]
+                             [buf_index];
                     if (pixmap != NULL)
                     {
                         pScreen->DestroyPixmap(pixmap);
@@ -95,8 +99,32 @@ rdpPutImage(DrawablePtr pDst, GCPtr pGC, int depth, int x, int y,
                     pixmap = (PixmapPtr) pDst;
                     LOG(LOG_LEVEL_INFO,
                         "rdpPutImage: setting conNumber %d, monitor num %d "
-                        "to pixmap %p", pBits32[1], monitor_index, pixmap);
-                    clientCon->accelAssistPixmaps[monitor_index] = pixmap;
+                        "buffer %d to pixmap %p", pBits32[1], monitor_index,
+                        buf_index, pixmap);
+                    clientCon->accelAssistPixmaps[monitor_index][buf_index] =
+                        pixmap;
+                    /* A freshly registered pixmap holds nothing, so it owes
+                       the whole screen. The invalidate below covers the
+                       buffer this frame lands in; without this the other one
+                       would carry only the damage since it was last written,
+                       which for a new pixmap is not the same thing. */
+                    if (clientCon->accelAssistPending[monitor_index]
+                        [buf_index] != NULL)
+                    {
+                        rdpRegionDestroy(
+                            clientCon->accelAssistPending[monitor_index]
+                            [buf_index]);
+                    }
+                    {
+                        BoxRec all;
+
+                        all.x1 = 0;
+                        all.y1 = 0;
+                        all.x2 = dev->width;
+                        all.y2 = dev->height;
+                        clientCon->accelAssistPending[monitor_index]
+                        [buf_index] = rdpRegionCreate(&all, 0);
+                    }
                     /* so it can not get freed early */
                     pixmap->refcnt++;
                     /* invalidate */
