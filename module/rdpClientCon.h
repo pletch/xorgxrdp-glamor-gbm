@@ -82,6 +82,22 @@ struct rdp_timing
     int idle_max_ms;
     int inflight_total;
     int damage_starved;
+    /* The MAX_CAPTURE_RECTS collapse in rdpCapRect: how often the dirty
+       region is replaced by its bounding box, how many rects that threw
+       away, and what it cost in area. waste is the bounding box area as a
+       percentage of the area actually dirty, so 100 means the collapse was
+       free and 3000 means it captured thirty times what it had to.
+
+       Nothing else in the pipe can see this: xrdp receives
+       REGION_NUM_RECTS() of the already-collapsed region, so from there on
+       a collapse is indistinguishable from the X server having reported one
+       large damage rect. */
+    int collapse_considered;    /* frames with more than one dirty rect */
+    int collapse_fired;
+    int collapse_rects_total;   /* pre-collapse rect count, when it fired */
+    int collapse_rects_max;
+    int collapse_waste_total;
+    int collapse_waste_max;
 };
 
 /* used in rdpGlyphs.c */

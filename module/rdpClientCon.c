@@ -1919,6 +1919,21 @@ rdpClientConProcessMsgClientRegionEx(rdpPtr dev, rdpClientCon *clientCon)
                 t->capture_count, t->damage_starved,
                 t->crtt_count ? t->crtt_total_ms / t->crtt_count : 0,
                 t->crtt_max_ms, (int) clientCon->msFrameInterval);
+            /* Separate line: it answers a different question, and it is only
+               interesting while the collapse is actually firing. */
+            LOG(LOG_LEVEL_INFO, "xorgxrdp dirty region collapse: fired %d of "
+                "%d multi-rect frames, rects discarded mean %d max %d, "
+                "bounding box vs dirty area mean %d%% max %d%%",
+                t->collapse_fired, t->collapse_considered,
+                t->collapse_fired
+                    ? t->collapse_rects_total / t->collapse_fired : 0,
+                t->collapse_rects_max,
+                t->collapse_fired
+                    ? t->collapse_waste_total / t->collapse_fired : 0,
+                t->collapse_waste_max);
+            t->collapse_considered = 0; t->collapse_fired = 0;
+            t->collapse_rects_total = 0; t->collapse_rects_max = 0;
+            t->collapse_waste_total = 0; t->collapse_waste_max = 0;
             t->count = 0;
             t->capture_total_ms = 0; t->capture_max_ms = 0;
             t->send_total_ms = 0; t->send_max_ms = 0;
@@ -3617,14 +3632,137 @@ rdpCapRect(rdpClientCon *clientCon, BoxPtr cap_rect, int mon,
         cap_rect->x1, cap_rect->y1, cap_rect->x2, cap_rect->y2);
     rdpRegionIntersect(cap_dirty, cap_dirty, clientCon->dirtyRegion);
     num_rects = REGION_NUM_RECTS(cap_dirty);
-    if (num_rects > MAX_CAPTURE_RECTS)
+    if (num_rects > 1)
     {
-        /* the dirty region is too complex, just get a rect that
-           covers the whole region */
+        /* Decide whether to replace the dirty region with its bounding box.
+
+           The historical rule is a cap on the rect count, on the assumption
+           that capture cost scales with it. On the accel-assist path it does
+           not: the per-rect work is a CopyArea blit in rdpCopyBoxList, and
+           the measurement recorded there puts the whole blit loop at 0 ms
+           against 10-19 ms for the GPU drain it no longer does. What the
+           collapse does cost is area -- the bounding box is by definition at
+           least the area actually dirty, and usually much more -- and that
+           area is paid again by the accel-assist shader pass, by the
+           metablock, and by the client's copy out of the decoded frame.
+
+           So count is a poor proxy for the trade being made. XORGXRDP_COLLAPSE
+           selects the rule:
+
+             count  (default)  collapse above XORGXRDP_COLLAPSE_MAX_RECTS,
+                               which defaults to MAX_CAPTURE_RECTS -- the
+                               behaviour that shipped
+             area              collapse only when it is nearly free, i.e. when
+                               the bounding box is within
+                               XORGXRDP_COLLAPSE_RATIO percent of the area
+                               actually dirty (default 200, so at most twice).
+                               A hard cap still applies, far higher, to bound
+                               the per-rect costs downstream
+             never             never collapse, for A/B
+
+           Sum of rect areas is exact here: pixman region rects are disjoint
+           by construction, so it is the union area, not an overcount. */
+        static int collapse_mode = -1;   /* 0 count, 1 area, 2 never */
+        static int collapse_ratio_pct;
+        static int collapse_max_rects;
+        BoxPtr dirty_rects;
+        long long union_area;
+        long long extents_area;
+        int waste_pct;
+        int index;
+        int collapse;
+
+        if (collapse_mode < 0)
+        {
+            const char *m = getenv("XORGXRDP_COLLAPSE");
+            const char *r = getenv("XORGXRDP_COLLAPSE_RATIO");
+            const char *c = getenv("XORGXRDP_COLLAPSE_MAX_RECTS");
+
+            collapse_mode = 0;
+            if (m != NULL && strcmp(m, "area") == 0)
+            {
+                collapse_mode = 1;
+            }
+            else if (m != NULL && strcmp(m, "never") == 0)
+            {
+                collapse_mode = 2;
+            }
+            collapse_ratio_pct = (r != NULL) ? atoi(r) : 200;
+            if (collapse_ratio_pct < 100)
+            {
+                collapse_ratio_pct = 100;
+            }
+            collapse_max_rects = (c != NULL) ? atoi(c)
+                                 : (collapse_mode == 1 ? 256
+                                                       : MAX_CAPTURE_RECTS);
+            if (collapse_max_rects < 1)
+            {
+                collapse_max_rects = 1;
+            }
+            LOG(LOG_LEVEL_INFO, "rdpCapRect: dirty region collapse mode %s, "
+                "ratio %d%%, max rects %d",
+                collapse_mode == 1 ? "area" :
+                (collapse_mode == 2 ? "never" : "count"),
+                collapse_ratio_pct, collapse_max_rects);
+        }
+
         rect = *rdpRegionExtents(cap_dirty);
-        rdpRegionDestroy(cap_dirty);
-        cap_dirty = rdpRegionCreate(&rect, 0);
-        num_rects = REGION_NUM_RECTS(cap_dirty);
+        extents_area = (long long) (rect.x2 - rect.x1) *
+                       (rect.y2 - rect.y1);
+        union_area = 0;
+        dirty_rects = REGION_RECTS(cap_dirty);
+        for (index = 0; index < num_rects; index++)
+        {
+            union_area += (long long) (dirty_rects[index].x2 -
+                                       dirty_rects[index].x1) *
+                          (dirty_rects[index].y2 - dirty_rects[index].y1);
+        }
+        waste_pct = (union_area > 0)
+                    ? (int) (extents_area * 100 / union_area) : 100;
+
+        switch (collapse_mode)
+        {
+            case 1:
+                collapse = (num_rects > collapse_max_rects) ||
+                           (waste_pct <= collapse_ratio_pct);
+                break;
+            case 2:
+                collapse = 0;
+                break;
+            default:
+                collapse = (num_rects > collapse_max_rects);
+                break;
+        }
+
+        if (clientCon->timing.enabled)
+        {
+            struct rdp_timing *t = &clientCon->timing;
+
+            t->collapse_considered++;
+            if (collapse)
+            {
+                t->collapse_fired++;
+                t->collapse_rects_total += num_rects;
+                if (num_rects > t->collapse_rects_max)
+                {
+                    t->collapse_rects_max = num_rects;
+                }
+                t->collapse_waste_total += waste_pct;
+                if (waste_pct > t->collapse_waste_max)
+                {
+                    t->collapse_waste_max = waste_pct;
+                }
+            }
+        }
+
+        if (collapse)
+        {
+            /* the dirty region is too complex, just get a rect that
+               covers the whole region */
+            rdpRegionDestroy(cap_dirty);
+            cap_dirty = rdpRegionCreate(&rect, 0);
+            num_rects = REGION_NUM_RECTS(cap_dirty);
+        }
     }
     /* make a copy of cap_dirty because it may get altered */
     cap_dirty_save = rdpRegionCreate(NullBox, 0);
