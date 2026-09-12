@@ -92,6 +92,17 @@ struct rdp_timing
        REGION_NUM_RECTS() of the already-collapsed region, so from there on
        a collapse is indistinguishable from the X server having reported one
        large damage rect. */
+    /* Every capture, not only the multi-rect ones: how many rects the dirty
+       region held and how much of the monitor they covered. The collapse
+       counters below only see frames with more than one rect, which made a
+       region that arrives as a single full-screen rect invisible -- the case
+       that actually matters, since it is what the client ends up copying. */
+    int dirty_frames;
+    int dirty_rects_total;
+    int dirty_rects_max;
+    int dirty_area_total;       /* percent of the monitor, summed */
+    int dirty_area_max;
+    int dirty_full_frames;      /* captures covering 90% or more */
     int collapse_considered;    /* frames with more than one dirty rect */
     int collapse_fired;
     int collapse_rects_total;   /* pre-collapse rect count, when it fired */

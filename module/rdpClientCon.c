@@ -1921,6 +1921,17 @@ rdpClientConProcessMsgClientRegionEx(rdpPtr dev, rdpClientCon *clientCon)
                 t->crtt_max_ms, (int) clientCon->msFrameInterval);
             /* Separate line: it answers a different question, and it is only
                interesting while the collapse is actually firing. */
+            LOG(LOG_LEVEL_INFO, "xorgxrdp dirty region: %d captures, rects "
+                "mean %d max %d, monitor covered mean %d%% max %d%%, "
+                "%d captures covered 90%% or more",
+                t->dirty_frames,
+                t->dirty_frames ? t->dirty_rects_total / t->dirty_frames : 0,
+                t->dirty_rects_max,
+                t->dirty_frames ? t->dirty_area_total / t->dirty_frames : 0,
+                t->dirty_area_max, t->dirty_full_frames);
+            t->dirty_frames = 0; t->dirty_rects_total = 0;
+            t->dirty_rects_max = 0; t->dirty_area_total = 0;
+            t->dirty_area_max = 0; t->dirty_full_frames = 0;
             LOG(LOG_LEVEL_INFO, "xorgxrdp dirty region collapse: fired %d of "
                 "%d multi-rect frames, rects discarded mean %d max %d, "
                 "bounding box vs dirty area mean %d%% max %d%%",
@@ -3632,7 +3643,7 @@ rdpCapRect(rdpClientCon *clientCon, BoxPtr cap_rect, int mon,
         cap_rect->x1, cap_rect->y1, cap_rect->x2, cap_rect->y2);
     rdpRegionIntersect(cap_dirty, cap_dirty, clientCon->dirtyRegion);
     num_rects = REGION_NUM_RECTS(cap_dirty);
-    if (num_rects > 1)
+    if (num_rects > 0)
     {
         /* Decide whether to replace the dirty region with its bounding box.
 
@@ -3720,21 +3731,53 @@ rdpCapRect(rdpClientCon *clientCon, BoxPtr cap_rect, int mon,
         waste_pct = (union_area > 0)
                     ? (int) (extents_area * 100 / union_area) : 100;
 
-        switch (collapse_mode)
+        if (num_rects < 2)
         {
-            case 1:
-                collapse = (num_rects > collapse_max_rects) ||
-                           (waste_pct <= collapse_ratio_pct);
-                break;
-            case 2:
-                collapse = 0;
-                break;
-            default:
-                collapse = (num_rects > collapse_max_rects);
-                break;
+            /* Nothing to collapse; the measurement above still applies. */
+            collapse = 0;
+        }
+        else
+        {
+            switch (collapse_mode)
+            {
+                case 1:
+                    collapse = (num_rects > collapse_max_rects) ||
+                               (waste_pct <= collapse_ratio_pct);
+                    break;
+                case 2:
+                    collapse = 0;
+                    break;
+                default:
+                    collapse = (num_rects > collapse_max_rects);
+                    break;
+            }
         }
 
         if (clientCon->timing.enabled)
+        {
+            struct rdp_timing *t = &clientCon->timing;
+            long long mon_area = (long long) (cap_rect->x2 - cap_rect->x1) *
+                                 (cap_rect->y2 - cap_rect->y1);
+            int area_pct = (mon_area > 0)
+                           ? (int) (union_area * 100 / mon_area) : 0;
+
+            t->dirty_frames++;
+            t->dirty_rects_total += num_rects;
+            if (num_rects > t->dirty_rects_max)
+            {
+                t->dirty_rects_max = num_rects;
+            }
+            t->dirty_area_total += area_pct;
+            if (area_pct > t->dirty_area_max)
+            {
+                t->dirty_area_max = area_pct;
+            }
+            if (area_pct >= 90)
+            {
+                t->dirty_full_frames++;
+            }
+        }
+        if (clientCon->timing.enabled && (num_rects > 1))
         {
             struct rdp_timing *t = &clientCon->timing;
 
