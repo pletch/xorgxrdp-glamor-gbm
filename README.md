@@ -33,6 +33,9 @@ exportable as a dma-buf and enables recent Intel GPUs.
 * **configurable refresh rate** — `XORGXRDP_VFREQ` replaces a hard-coded 50 Hz
 * **capture timing** — `XORGXRDP_TIMING=1` reports per-frame capture, handoff,
   send-to-ack, idle, in-flight, client round trip and the current interval
+* **glamor: allocate the screen pixmap with explicit modifiers** (opt-in) — on
+  xe, implicit allocation is LINEAR; with glamor dmabuf-capable, the screen
+  gets a tiled, compressed layout instead. See *Tiled screen pixmap on xe*.
 
 ### Used with
 [pletch/xrdp-vaapi-encode](https://github.com/pletch/xrdp-vaapi-encode) built with
@@ -144,6 +147,33 @@ vaapi_init: VA-API 1.22 driver 'Intel iHD driver ...'   # xrdp-accel-assist.NN.l
 Note also `Option "DRMAllowList"` (default `"amdgpu i915 xe msm radeon"`): glamor is
 only enabled when the DRM driver name matches an entry, so an unlisted driver silently
 takes the software path with `rdpPreInit: unsupported render node` in the Xorg log.
+
+### Tiled screen pixmap on xe (opt-in)
+
+The xe KMD has no tiling uapi, so a screen pixmap allocated without modifiers
+falls back to LINEAR, and every glamor draw lands in untiled, uncompressed
+memory. With explicit modifiers, Mesa picks a tiled, compressed layout instead.
+This only happens when glamor is dmabuf-capable, which on Xorg 21.1 is a
+`ServerFlags` option in the session's `xorg.conf`:
+
+    Section "ServerFlags"
+        ...
+        Option "Debug" "dmabuf_capable"
+    EndSection
+
+The Xorg log then shows the chosen layout, e.g.
+
+    rdpRRScreenCreateBacking: screen bo 1920x1080 modifier 0x0100000000000011 (explicit)
+
+Measured on an Arc Pro B50 (Battlemage) with 1080p video in the session:
+render-engine busy time down ~27%. Verified correct on Alder Lake-S
+(`Y_TILED_GEN12_RC_CCS_CC`).
+
+`dmabuf_capable` is global, and upstream still describes it as enabling
+"unstable buffer management code" (`xorg.conf(5)`). It changes how glamor hands
+buffers to every DRI3 client in the session, not just the screen. It has run
+cleanly in testing, but if a GPU application misbehaves, removing the option
+restores the previous behaviour.
 
 ## Overview
 
