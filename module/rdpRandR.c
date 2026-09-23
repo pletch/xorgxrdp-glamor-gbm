@@ -189,20 +189,51 @@ rdpRRScreenCreateBacking(ScreenPtr pScreen)
 #if defined(XORGXRDP_GLAMOR)
     if (dev->glamor)
     {
-        struct gbm_bo *bo;
+        struct gbm_bo *bo = NULL;
+        Bool used_modifiers = FALSE;
+        uint32_t num_modifiers = 0;
+        uint64_t *modifiers = NULL;
 
-        bo = gbm_bo_create(dev->gbm, dev->width, dev->height,
-                                   GBM_FORMAT_XRGB8888,
-                                   GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+        /* Let the driver pick the tiling from the modifiers glamor can
+         * render to. With implicit allocation the tiling comes from the
+         * kernel, and the xe KMD has no tiling uapi, so Mesa falls back to
+         * LINEAR there: every glamor draw into the screen then goes to
+         * untiled, uncompressed memory. glamor only reports modifiers when
+         * it is dmabuf capable (Option "Debug" "dmabuf_capable" in the
+         * ServerFlags section of xorg.conf), which is also what makes it
+         * export them, so a tiled screen is never handed to another
+         * process as if it were implicit. */
+        if (glamor_get_modifiers(pScreen, GBM_FORMAT_XRGB8888,
+                                 &num_modifiers, &modifiers) &&
+                num_modifiers > 0)
+        {
+            bo = gbm_bo_create_with_modifiers2(dev->gbm, dev->width,
+                                               dev->height,
+                                               GBM_FORMAT_XRGB8888,
+                                               modifiers, num_modifiers,
+                                               GBM_BO_USE_RENDERING);
+            used_modifiers = (bo != NULL);
+        }
+        free(modifiers);
+
+        if (bo == NULL)
+        {
+            bo = gbm_bo_create(dev->gbm, dev->width, dev->height,
+                               GBM_FORMAT_XRGB8888,
+                               GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+        }
         if (bo == NULL)
         {
             LOG(LOG_LEVEL_ERROR, "rdpRRScreenCreateBacking: gbm_bo_create failed");
             return FALSE;
         }
+        LOG(LOG_LEVEL_INFO, "rdpRRScreenCreateBacking: screen bo %dx%d "
+            "modifier 0x%016llx (%s)", dev->width, dev->height,
+            (unsigned long long) gbm_bo_get_modifier(bo),
+            used_modifiers ? "explicit" : "implicit");
 
-        /* gbm_bo_create() does not allocate the BO with explicit modifiers. */
         if (!glamor_egl_create_textured_pixmap_from_gbm_bo(screenPixmap, bo,
-                                                           FALSE))
+                                                           used_modifiers))
         {
             LOG(LOG_LEVEL_ERROR, "rdpRRScreenCreateBacking: glamor_egl_create_textured_pixmap_from_gbm_bo failed");
             gbm_bo_destroy(bo);
