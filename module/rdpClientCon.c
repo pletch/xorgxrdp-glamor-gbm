@@ -36,6 +36,8 @@ Client connection to xrdp
 #include <sys/shm.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <poll.h>
+#include <unistd.h>
 
 /* this should be before all X11 .h files */
 #include <xorg-server.h>
@@ -1205,11 +1207,43 @@ rdpClientConProcessMsgClientInput(rdpPtr dev, rdpClientCon *clientCon)
 }
 
 /******************************************************************************/
+/* Wait for the helper's readiness byte, written once its encoder is up.
+   0: ready, or still alive after ACCEL_ASSIST_READY_MS (a helper that
+   predates the handshake never writes it). 1: it exited first, closing
+   the pipe. */
+#define ACCEL_ASSIST_READY_MS 3000
+
+static int
+rdpAccelAssistWaitReady(int fd, pid_t pid)
+{
+    struct pollfd p;
+    char c;
+    int n;
+
+    p.fd = fd;
+    p.events = POLLIN;
+    p.revents = 0;
+    do
+    {
+        n = poll(&p, 1, ACCEL_ASSIST_READY_MS);
+    }
+    while (n < 0 && errno == EINTR);
+    if (n <= 0)
+    {
+        LOG(LOG_LEVEL_INFO, "rdpAccelAssistWaitReady: no readiness from "
+            "accel assist pid %d; assuming it is running", (int) pid);
+        return 0;
+    }
+    return read(fd, &c, 1) == 1 ? 0 : 1;
+}
+
+/******************************************************************************/
 static int
 rdpStartAccelAssist(rdpPtr dev, rdpClientCon *clientCon)
 {
     char text[64];
     int spair[2];
+    int ready[2];
     int index;
 
     // Accel assist is already running, don't attempt to initialize it again.
@@ -1218,7 +1252,17 @@ rdpStartAccelAssist(rdpPtr dev, rdpClientCon *clientCon)
         return 0;
     }
 
-    socketpair(AF_UNIX, SOCK_STREAM, 0, spair);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, spair) != 0)
+    {
+        return 1;
+    }
+    /* The helper reports on this once its encoder has started */
+    if (pipe(ready) != 0)
+    {
+        close(spair[0]);
+        close(spair[1]);
+        return 1;
+    }
 
     clientCon->accel_assist_pid = fork();
     if (clientCon->accel_assist_pid == -1)
@@ -1226,13 +1270,17 @@ rdpStartAccelAssist(rdpPtr dev, rdpClientCon *clientCon)
         /* error */
         close(spair[0]);
         close(spair[1]);
+        close(ready[0]);
+        close(ready[1]);
+        return 1;
     }
     else if (clientCon->accel_assist_pid == 0)
     {
         /* child */
         for (index = 0; index < 256; index++)
         {
-            if ((index != clientCon->sck) && (index != spair[0]))
+            if ((index != clientCon->sck) && (index != spair[0]) &&
+                    (index != ready[1]))
             {
                 close(index);
             }
@@ -1253,6 +1301,9 @@ rdpStartAccelAssist(rdpPtr dev, rdpClientCon *clientCon)
         snprintf(text, 63, "%d", clientCon->sck);
         text[63] = 0;
         setenv("XORGXRDP_XRDP_FD", text, 1);
+        snprintf(text, 63, "%d", ready[1]);
+        text[63] = 0;
+        setenv("XRDP_ACCEL_ASSIST_READY_FD", text, 1);
         snprintf(text, 63, "%s/xrdp-accel-assist", XRDP_LIBEXEC_PATH);
         text[63] = 0;
         execlp(text, text, "-d", (void *) 0);
@@ -1263,6 +1314,23 @@ rdpStartAccelAssist(rdpPtr dev, rdpClientCon *clientCon)
         /* parent */
         LOG(LOG_LEVEL_INFO, "rdpStartAccelAssist: started accel assist pid %d",
             clientCon->accel_assist_pid);
+        close(ready[1]);
+        if (rdpAccelAssistWaitReady(ready[0], clientCon->accel_assist_pid) != 0)
+        {
+            /* Its encoder could not start. It holds a copy of the xrdp
+               socket, but ours is still open: the connection carries on,
+               without accel assist (xrdp encodes). */
+            close(ready[0]);
+            close(spair[0]);
+            close(spair[1]);
+            kill(clientCon->accel_assist_pid, SIGTERM);
+            waitpid(clientCon->accel_assist_pid, NULL, 0);
+            clientCon->accel_assist_pid = -1;
+            LOG(LOG_LEVEL_WARNING, "rdpStartAccelAssist: accel assist could "
+                "not start its encoder; continuing without it");
+            return 1;
+        }
+        close(ready[0]);
         rdpClientConRemoveEnabledDevice(clientCon->sck);
         close(clientCon->sck);
         close(spair[0]);
@@ -1617,9 +1685,11 @@ rdpClientConProcessMsgClientInfo(rdpPtr dev, rdpClientCon *clientCon)
     }
     if (rdpClientConUseAccelAssist(dev, clientCon))
     {
-        clientCon->use_accel_assist = 1;
-        rdpStartAccelAssist(dev, clientCon);
-        rdpSendAccelAssistMonitors(dev, clientCon);
+        if (rdpStartAccelAssist(dev, clientCon) == 0)
+        {
+            clientCon->use_accel_assist = 1;
+            rdpSendAccelAssistMonitors(dev, clientCon);
+        }
     }
 
     return 0;
