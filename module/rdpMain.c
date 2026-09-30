@@ -257,6 +257,54 @@ xorgxrdpExtension(CallbackListPtr *pcbl, void *unused, void *calldata)
 #endif
 
 /******************************************************************************/
+/* The NVIDIA driver starts the screen at its own size (640x480 with no
+   display attached) and xorgxrdp only resizes it when the client connects.
+   The desktop session can start before that and keep the old size. Apply
+   the client's size now, before any client is served, as xrdpdev does. */
+static void
+xorgxrdpApplyStartSize(rdpPtr dev)
+{
+    ScrnInfoPtr pScrn;
+    const char *env;
+    int width;
+    int height;
+    Bool ok;
+
+    env = getenv("XRDP_START_WIDTH");
+    if (env == NULL)
+    {
+        return;
+    }
+    width = atoi(env);
+    env = getenv("XRDP_START_HEIGHT");
+    if (env == NULL)
+    {
+        return;
+    }
+    height = atoi(env);
+    if ((width < 16) || (width >= 8192) || (height < 16) || (height >= 8192))
+    {
+        return;
+    }
+    if ((width == dev->width) && (height == dev->height))
+    {
+        return;
+    }
+    if (rrGetScrPriv(dev->pScreen) == NULL)
+    {
+        return;
+    }
+    pScrn = xf86Screens[dev->pScreen->myNum];
+    dev->allow_screen_resize = 1;
+    ok = RRScreenSizeSet(dev->pScreen, width, height,
+                         PixelToMM(width, pScrn->xDpi),
+                         PixelToMM(height, pScrn->yDpi));
+    dev->allow_screen_resize = 0;
+    LOG(LOG_LEVEL_INFO, "xorgxrdpApplyStartSize: width %d height %d ok %d",
+        width, height, ok);
+}
+
+/******************************************************************************/
 /* returns error */
 static CARD32
 xorgxrdpDeferredStartup(OsTimerPtr timer, CARD32 now, pointer arg)
@@ -269,6 +317,8 @@ xorgxrdpDeferredStartup(OsTimerPtr timer, CARD32 now, pointer arg)
     if (pScreen->root != NULL)
     {
         dev = rdpGetDevFromScreen(pScreen);
+        /* Before the local RandR takes its outputs from the size. */
+        xorgxrdpApplyStartSize(dev);
 #if defined(XORGXRDP_LRANDR)
         if (!g_nvidia_grid)
         {
