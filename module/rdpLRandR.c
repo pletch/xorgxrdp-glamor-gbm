@@ -34,10 +34,10 @@ mode ids    33      48
 
 #define LRANDR_NAME                     "RANDR"
 #define SERVER_LRANDR_MAJOR_VERSION     1
-#define SERVER_LRANDR_MINOR_VERSION     3
+#define SERVER_LRANDR_MINOR_VERSION     5
 #define LRRNumberEvents                 2
 #define LRRNumberErrors                 4
-#define LRRNumberRequests               32 /* 1.3 */
+#define LRRNumberRequests               45 /* 1.5 */
 #define LRRMaxCrtcs                     16
 #define LRRMaxOutputs                   16
 #define LRRMaxOutputNameLength          32
@@ -296,10 +296,23 @@ ProcLRRSelectInput(ClientPtr client)
         return rc;
     }
 
-    if (stuff->enable & (RRScreenChangeNotifyMask |
-                         RRCrtcChangeNotifyMask |
-                         RROutputChangeNotifyMask |
-                         RROutputPropertyNotifyMask))
+    /* 1.4 adds provider and resource events. There are no providers
+       and the resources never change, so those are accepted and never
+       sent. */
+    if ((stuff->enable & ~(RRScreenChangeNotifyMask |
+                           RRCrtcChangeNotifyMask |
+                           RROutputChangeNotifyMask |
+                           RROutputPropertyNotifyMask |
+                           RRProviderChangeNotifyMask |
+                           RRProviderPropertyNotifyMask |
+                           RRResourceChangeNotifyMask)) != 0)
+    {
+        LOG(LOG_LEVEL_INFO,
+            "ProcLRRSelectInput: bad enable 0x%8.8x", stuff->enable);
+        client->errorValue = stuff->enable;
+        return BadValue;
+    }
+    if (stuff->enable != 0)
     {
         ic = (interestedClientRec *) calloc(1, sizeof(interestedClientRec));
         if (ic == NULL)
@@ -315,17 +328,10 @@ ProcLRRSelectInput(ClientPtr client)
             "pClient to list", client);
         xorg_list_add(&(ic->entry), &g_interestedClients);
     }
-    else if (stuff->enable == 0)
+    else
     {
         /* delete the interest */
         remove_client(client);
-    }
-    else
-    {
-        LOG(LOG_LEVEL_INFO,
-            "ProcLRRSelectInput: bad enable 0x%8.8x", stuff->enable);
-        client->errorValue = stuff->enable;
-        return BadValue;
     }
     return Success;
 }
@@ -978,6 +984,150 @@ ProcLRRGetOutputPrimary(ClientPtr client)
 }
 
 /******************************************************************************/
+/* 32 */
+/*  RRGetProviders
+        window: WINDOW
+        x
+        timestamp: TIMESTAMP
+        providers: LISTofPROVIDER */
+static int
+ProcLRRGetProviders(ClientPtr client)
+{
+    xRRGetProvidersReply rep;
+    REQUEST(xRRGetProvidersReq);
+
+    (void) stuff;
+
+    LOG(LOG_LEVEL_TRACE, "ProcLRRGetProviders:                client %p",
+        client);
+    REQUEST_SIZE_MATCH(xRRGetProvidersReq);
+    memset(&rep, 0, sizeof(rep));
+    rep.type = X_Reply;
+    rep.sequenceNumber = client->sequence;
+    rep.timestamp = g_updateTime;
+    rep.nProviders = 0;
+    WriteToClient(client, sizeof(rep), &rep);
+    return Success;
+}
+
+/******************************************************************************/
+/* 33 - 41 */
+/*  The provider requests. There are no providers, so every provider named
+    is unknown. */
+static int
+ProcLRRNoProvider(ClientPtr client)
+{
+    LOG(LOG_LEVEL_TRACE, "ProcLRRNoProvider:                  client %p",
+        client);
+    return LRRErrorBase + BadRRProvider;
+}
+
+/******************************************************************************/
+/* 42 */
+/*  RRGetMonitors
+        window: WINDOW
+        get-active: BOOL
+        x
+        timestamp: TIMESTAMP
+        monitors: LISTofMONITORINFO
+    One monitor per output, named after it, as the X server's own RandR
+    does for monitors nobody has defined. xfdesktop (libxfce4windowing)
+    and GTK track monitors through this request, and without it take the
+    screen size once and never follow a resize. */
+static int
+ProcLRRGetMonitors(ClientPtr client)
+{
+    xRRGetMonitorsReply rep;
+    xRRMonitorInfo info;
+    WindowPtr pWin;
+    ScreenPtr pScreen;
+    LRRCrtcRec *crtc;
+    CARD8 *extra;
+    CARD8 *p;
+    int extraLen;
+    int count;
+    int index;
+    int rc;
+    REQUEST(xRRGetMonitorsReq);
+
+    LOG(LOG_LEVEL_TRACE, "ProcLRRGetMonitors:                 client %p",
+        client);
+    REQUEST_SIZE_MATCH(xRRGetMonitorsReq);
+    rc = dixLookupWindow(&pWin, stuff->window, client, DixGetAttrAccess);
+    if (rc != Success)
+    {
+        return rc;
+    }
+    pScreen = pWin->drawable.pScreen;
+    count = min(g_numCrtcs, g_numOutputs);
+    extraLen = count * (sizeof(xRRMonitorInfo) + sizeof(RROutput));
+    extra = NULL;
+    if (extraLen > 0)
+    {
+        extra = calloc(1, extraLen);
+        if (extra == NULL)
+        {
+            return BadAlloc;
+        }
+    }
+    p = extra;
+    for (index = 0; index < count; index++)
+    {
+        crtc = g_crtcs + index;
+        memset(&info, 0, sizeof(info));
+        info.name = MakeAtom(g_outputs[index].name,
+                             strlen(g_outputs[index].name), TRUE);
+        info.primary = (g_outputs[index].id == g_primaryOutput);
+        info.automatic = TRUE;
+        info.noutput = 1;
+        info.x = crtc->x;
+        info.y = crtc->y;
+        info.width = crtc->width;
+        info.height = crtc->height;
+        /* The screen's size in millimetres, shared out by pixels. */
+        if ((pScreen->width > 0) && (pScreen->height > 0))
+        {
+            info.widthInMillimeters = (CARD32)
+                                      ((long) crtc->width * pScreen->mmWidth /
+                                       pScreen->width);
+            info.heightInMillimeters = (CARD32)
+                                       ((long) crtc->height * pScreen->mmHeight /
+                                        pScreen->height);
+        }
+        memcpy(p, &info, sizeof(info));
+        p += sizeof(info);
+        memcpy(p, &(g_outputs[index].id), sizeof(RROutput));
+        p += sizeof(RROutput);
+    }
+    memset(&rep, 0, sizeof(rep));
+    rep.type = X_Reply;
+    rep.sequenceNumber = client->sequence;
+    rep.length = bytes_to_int32(extraLen);
+    rep.timestamp = g_updateTime;
+    rep.nmonitors = count;
+    rep.noutputs = count;
+    WriteToClient(client, sizeof(rep), &rep);
+    if (extra != NULL)
+    {
+        WriteToClient(client, extraLen, extra);
+        free(extra);
+    }
+    return Success;
+}
+
+/******************************************************************************/
+/* 43, 44 */
+/*  RRSetMonitor, RRDeleteMonitor. The monitors follow the RDP client's
+    layout; they are not the clients' to change. */
+static int
+ProcLRRChangeMonitor(ClientPtr client)
+{
+    LOG(LOG_LEVEL_TRACE, "ProcLRRChangeMonitor:               client %p",
+        client);
+    return BadAccess;
+}
+
+/******************************************************************************/
 static int
 ProcLRRDispatch(ClientPtr client)
 {
@@ -1116,6 +1266,16 @@ rdpLRRInit(rdpPtr dev)
     //g_procLRandrVector[29] = ProcLRRSetPanning; TODO
     //g_procLRandrVector[30] = ProcLRRSetOutputPrimary; ok
     g_procLRandrVector[31] = ProcLRRGetOutputPrimary;
+    /* V1.4 additions */
+    g_procLRandrVector[32] = ProcLRRGetProviders;
+    for (index = 33; index <= 41; index++)
+    {
+        g_procLRandrVector[index] = ProcLRRNoProvider;
+    }
+    /* V1.5 additions */
+    g_procLRandrVector[42] = ProcLRRGetMonitors;
+    g_procLRandrVector[43] = ProcLRRChangeMonitor;
+    g_procLRandrVector[44] = ProcLRRChangeMonitor;
     rdpLRRSetRdpOutputs(dev);
     return 0;
 }
