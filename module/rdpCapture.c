@@ -779,8 +779,9 @@ rdpCopyBoxList(rdpClientCon *clientCon, PixmapPtr dstPixmap,
     /* Make the copy visible to the next reader. cpu_read: the caller reads
        it with the CPU, so drain (1x1 GetImage). Otherwise the reader is
        accel-assist on the same DRM device, and a flush is enough: implicit
-       fences order its reads after our writes. */
-    if (cpu_read)
+       fences order its reads after our writes. Without glamor (the NVIDIA
+       driver) there is nothing to flush, so drain as upstream does. */
+    if (cpu_read || !dev->glamor)
     {
         if (clientCon->timing.enabled)
         {
