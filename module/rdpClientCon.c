@@ -947,6 +947,41 @@ rdpDeferredIdleDisconnectCallback(OsTimerPtr timer, CARD32 now, pointer arg)
 }
 
 /*****************************************************************************/
+/* Stop the helper and collect it, without the X server waiting on it for
+   long: a helper asleep in the kernel on the GPU does not take SIGTERM,
+   and waitpid() without a limit then stopped the whole session. */
+static void
+rdpAccelAssistReap(pid_t pid, int *exit_code)
+{
+    int status = 0;
+    int tries;
+    int sig;
+
+    for (sig = SIGTERM; ; sig = SIGKILL)
+    {
+        kill(pid, sig);
+        for (tries = 0; tries < 50; tries++)
+        {
+            if (waitpid(pid, &status, WNOHANG) != 0)
+            {
+                if (exit_code != NULL)
+                {
+                    *exit_code = status;
+                }
+                return;
+            }
+            usleep(10 * 1000);
+        }
+        if (sig == SIGKILL)
+        {
+            break;
+        }
+    }
+    LOG(LOG_LEVEL_WARNING, "rdpAccelAssistReap: accel assist pid %d does "
+        "not exit; no longer waiting for it", (int) pid);
+}
+
+/*****************************************************************************/
 static int
 rdpShutdownAccelAssist(rdpPtr dev, rdpClientCon *clientCon) {
     ScreenPtr pScreen;
@@ -962,8 +997,7 @@ rdpShutdownAccelAssist(rdpPtr dev, rdpClientCon *clientCon) {
     if (waitpid(clientCon->accel_assist_pid, &exit_code, WNOHANG) == 0)
     {
         /* still running */
-        kill(clientCon->accel_assist_pid, SIGTERM);
-        waitpid(clientCon->accel_assist_pid, &exit_code, 0);
+        rdpAccelAssistReap(clientCon->accel_assist_pid, &exit_code);
     }
     pScreen = clientCon->dev->pScreen;
     for (index = 0; index < 16; index++)
@@ -1987,8 +2021,7 @@ rdpStartAccelAssist(rdpPtr dev, rdpClientCon *clientCon)
             close(ready[0]);
             close(spair[0]);
             close(spair[1]);
-            kill(clientCon->accel_assist_pid, SIGTERM);
-            waitpid(clientCon->accel_assist_pid, NULL, 0);
+            rdpAccelAssistReap(clientCon->accel_assist_pid, NULL);
             clientCon->accel_assist_pid = -1;
             LOG(LOG_LEVEL_WARNING, "rdpStartAccelAssist: accel assist could "
                 "not start its encoder; continuing without it");
