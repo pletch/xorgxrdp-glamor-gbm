@@ -1888,11 +1888,12 @@ rdpClientConProcessMsgClientInput(rdpPtr dev, rdpClientCon *clientCon)
 }
 
 /******************************************************************************/
-/* Wait for the helper's readiness byte, written once its encoder is up.
-   0: ready, or still alive after ACCEL_ASSIST_READY_MS (a helper that
-   predates the handshake never writes it). 1: it exited first, closing
-   the pipe. */
-#define ACCEL_ASSIST_READY_MS 3000
+/* Wait for the helper's readiness byte, written once its encoder is up
+   and has passed its self-test. 0: ready. 1: it exited first, closing the
+   pipe, or did not answer within ACCEL_ASSIST_READY_MS. A helper that
+   has not answered is not handed the client: one that fails after that
+   point takes the connection with it. */
+#define ACCEL_ASSIST_READY_MS 8000
 
 static int
 rdpAccelAssistWaitReady(int fd, pid_t pid)
@@ -1911,9 +1912,10 @@ rdpAccelAssistWaitReady(int fd, pid_t pid)
     while (n < 0 && errno == EINTR);
     if (n <= 0)
     {
-        LOG(LOG_LEVEL_INFO, "rdpAccelAssistWaitReady: no readiness from "
-            "accel assist pid %d; assuming it is running", (int) pid);
-        return 0;
+        LOG(LOG_LEVEL_WARNING, "rdpAccelAssistWaitReady: no readiness from "
+            "accel assist pid %d within %d ms", (int) pid,
+            ACCEL_ASSIST_READY_MS);
+        return 1;
     }
     return read(fd, &c, 1) == 1 ? 0 : 1;
 }
