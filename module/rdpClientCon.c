@@ -947,6 +947,41 @@ rdpDeferredIdleDisconnectCallback(OsTimerPtr timer, CARD32 now, pointer arg)
 }
 
 /*****************************************************************************/
+/* Stop the helper and collect it, without the X server waiting on it for
+   long: a helper asleep in the kernel on the GPU does not take SIGTERM,
+   and waitpid() without a limit then stopped the whole session. */
+static void
+rdpAccelAssistReap(pid_t pid, int *exit_code)
+{
+    int status = 0;
+    int tries;
+    int sig;
+
+    for (sig = SIGTERM; ; sig = SIGKILL)
+    {
+        kill(pid, sig);
+        for (tries = 0; tries < 50; tries++)
+        {
+            if (waitpid(pid, &status, WNOHANG) != 0)
+            {
+                if (exit_code != NULL)
+                {
+                    *exit_code = status;
+                }
+                return;
+            }
+            usleep(10 * 1000);
+        }
+        if (sig == SIGKILL)
+        {
+            break;
+        }
+    }
+    LOG(LOG_LEVEL_WARNING, "rdpAccelAssistReap: accel assist pid %d does "
+        "not exit; no longer waiting for it", (int) pid);
+}
+
+/*****************************************************************************/
 static int
 rdpShutdownAccelAssist(rdpPtr dev, rdpClientCon *clientCon) {
     ScreenPtr pScreen;
@@ -962,8 +997,7 @@ rdpShutdownAccelAssist(rdpPtr dev, rdpClientCon *clientCon) {
     if (waitpid(clientCon->accel_assist_pid, &exit_code, WNOHANG) == 0)
     {
         /* still running */
-        kill(clientCon->accel_assist_pid, SIGTERM);
-        waitpid(clientCon->accel_assist_pid, &exit_code, 0);
+        rdpAccelAssistReap(clientCon->accel_assist_pid, &exit_code);
     }
     pScreen = clientCon->dev->pScreen;
     for (index = 0; index < 16; index++)
@@ -1854,11 +1888,12 @@ rdpClientConProcessMsgClientInput(rdpPtr dev, rdpClientCon *clientCon)
 }
 
 /******************************************************************************/
-/* Wait for the helper's readiness byte, written once its encoder is up.
-   0: ready, or still alive after ACCEL_ASSIST_READY_MS (a helper that
-   predates the handshake never writes it). 1: it exited first, closing
-   the pipe. */
-#define ACCEL_ASSIST_READY_MS 3000
+/* Wait for the helper's readiness byte, written once its encoder is up
+   and has passed its self-test. 0: ready. 1: it exited first, closing the
+   pipe, or did not answer within ACCEL_ASSIST_READY_MS. A helper that
+   has not answered is not handed the client: one that fails after that
+   point takes the connection with it. */
+#define ACCEL_ASSIST_READY_MS 8000
 
 static int
 rdpAccelAssistWaitReady(int fd, pid_t pid)
@@ -1877,9 +1912,10 @@ rdpAccelAssistWaitReady(int fd, pid_t pid)
     while (n < 0 && errno == EINTR);
     if (n <= 0)
     {
-        LOG(LOG_LEVEL_INFO, "rdpAccelAssistWaitReady: no readiness from "
-            "accel assist pid %d; assuming it is running", (int) pid);
-        return 0;
+        LOG(LOG_LEVEL_WARNING, "rdpAccelAssistWaitReady: no readiness from "
+            "accel assist pid %d within %d ms", (int) pid,
+            ACCEL_ASSIST_READY_MS);
+        return 1;
     }
     return read(fd, &c, 1) == 1 ? 0 : 1;
 }
@@ -1987,8 +2023,7 @@ rdpStartAccelAssist(rdpPtr dev, rdpClientCon *clientCon)
             close(ready[0]);
             close(spair[0]);
             close(spair[1]);
-            kill(clientCon->accel_assist_pid, SIGTERM);
-            waitpid(clientCon->accel_assist_pid, NULL, 0);
+            rdpAccelAssistReap(clientCon->accel_assist_pid, NULL);
             clientCon->accel_assist_pid = -1;
             LOG(LOG_LEVEL_WARNING, "rdpStartAccelAssist: accel assist could "
                 "not start its encoder; continuing without it");
